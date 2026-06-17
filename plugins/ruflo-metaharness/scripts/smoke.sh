@@ -191,6 +191,15 @@ grep -q "execCli(\[\s*'-y'\s*,\s*'metaharness@latest'" "$F" 2>/dev/null || \
 grep -q "cwd: opts" "$F" || miss="$miss no-cwd-passthrough"
 [[ -z "$miss" ]] && ok || bad "$miss"
 
+step "17z62. CI dispatcher round-trip enforces wall budget (iter 99)"
+miss=""
+W="$ROOT/../../.github/workflows/metaharness-ci.yml"
+# Wall-clock budget check added to iter-98 step
+grep -q "dispatcher fast-path wall \${WALL}ms > 30000ms" "$W" 2>/dev/null || miss="$miss no-wall-budget-check"
+grep -q 'j.timing?.parallelWallMs' "$W" 2>/dev/null || miss="$miss no-wall-extraction"
+grep -q "WALL=\\\$" "$W" 2>/dev/null || miss="$miss no-wall-var"
+[[ -z "$miss" ]] && ok || bad "$miss"
+
 step "17z61. drift-from-history dispatcher round-trip in CI (iter 98)"
 miss=""
 W="$ROOT/../../.github/workflows/metaharness-ci.yml"

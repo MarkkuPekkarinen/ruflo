@@ -458,5 +458,16 @@ jobs:
           # synthesizes the listResult correctly through the dispatcher)
           echo "$OUT" | grep -q '"skippedAuditList": true' \
             || { echo "FAIL: dispatcher fast-path bypass not active"; exit 1; }
-          echo "✓ drift-from-history dispatcher round-trip green (fast-path via CLI)"
+          # iter 99 — also verify the fast-path actually delivers the
+          # measured ~1.4s baseline (slow path is ~26s). Allow 30s budget
+          # to tolerate slow CI runners while still catching a ~10x regression.
+          WALL=$(node -e "
+            const j = JSON.parse(\`$OUT\`);
+            console.log(j.timing?.parallelWallMs ?? 0);
+          ")
+          if [ "$WALL" -gt 30000 ]; then
+            echo "FAIL: dispatcher fast-path wall ${WALL}ms > 30000ms (regression?)"
+            exit 1
+          fi
+          echo "✓ drift-from-history dispatcher round-trip green (fast-path via CLI; wall ${WALL}ms)"
 
