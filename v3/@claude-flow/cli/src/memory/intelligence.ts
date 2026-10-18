@@ -11,10 +11,13 @@
  * @module v3/cli/intelligence
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
+import { resolveTrainingBackend } from '../ruvector/lora-adapter.js';
+import { getProjectCwd } from '../mcp-tools/types.js';
+import { withStatsFileLock } from './stats-file-lock.js';
 
 // ============================================================================
 // Persistence Configuration
@@ -26,7 +29,11 @@ import { dirname, join } from 'node:path';
  * falling back to home directory
  */
 function getDataDir(): string {
-  const cwd = process.cwd();
+  // Every MCP tool resolves `.claude-flow/` against the project root
+  // (CLAUDE_FLOW_CWD when set), so the neural stats/patterns must too —
+  // otherwise an MCP server whose process cwd differs from the project
+  // writes learning state where nothing reads it.
+  const cwd = getProjectCwd();
   const localDir = join(cwd, '.claude-flow', 'neural');
   const homeDir = join(homedir(), '.claude-flow', 'neural');
 
@@ -359,10 +366,20 @@ class LocalSonaCoordinator {
 
           // Check EWC penalty before applying update
           if (ewcConsolidator) {
-            const oldWeights = [oldConfidence];
             const proposedConfidence = Math.min(1.0, oldConfidence + this.config.loraLearningRate * reward);
-            const newWeights = [proposedConfidence];
-            const penalty = ewcConsolidator.getPenalty(oldWeights, newWeights);
+            // Use computeConfidencePenalty (averages the full Fisher diagonal),
+            // not getPenalty([oldConf],[newConf]) — that call shape collapses
+            // to fisherDiag[0] only (Math.min(1,1,384) === 1), an arbitrary
+            // single dimension instead of the full accumulated Fisher signal.
+            // computeConfidencePenalty exists precisely for this
+            // scalar-confidence case (see its docstring) but was unwired.
+            // Note: neither call shape differentiates between patterns — both
+            // take only a confidence delta, not a per-pattern embedding, so
+            // two patterns with the same delta under the same consolidator
+            // state get the same penalty either way. This fix corrects which
+            // shared Fisher signal informs that penalty; it does not add
+            // per-pattern discrimination (see ewc-distill-confidence-gate.test.ts).
+            const penalty = ewcConsolidator.computeConfidencePenalty(oldConfidence, proposedConfidence);
             totalEwcPenalty += penalty;
 
             // If penalty is too high, reduce the update magnitude
@@ -392,15 +409,14 @@ class LocalSonaCoordinator {
       }
     }
 
-    // Update EWC Fisher matrix with confidence changes
+    // Update EWC Fisher matrix with confidence changes. updateFisherFromConfidences
+    // takes the full per-pattern embedding + confidence-delta batch directly (it
+    // computes the same squared confidence-delta-scaled-embedding gradient proxy
+    // internally) — replaces the previous per-change recordGradient loop, which
+    // updated the full 384-dim globalFisher but fed a signal that getPenalty's
+    // 1-element call shape then read back only at index 0.
     if (ewcConsolidator && confidenceChanges.length > 0) {
-      for (const change of confidenceChanges) {
-        // Use confidence delta as gradient proxy
-        const gradient = change.embedding.map(
-          e => e * Math.abs(change.newConf - change.oldConf)
-        );
-        ewcConsolidator.recordGradient(change.id, gradient, true);
-      }
+      ewcConsolidator.updateFisherFromConfidences(confidenceChanges);
     }
 
     // Persist updated patterns
@@ -547,8 +563,12 @@ class LocalReasoningBank {
    * Deduplicates by content: if a pattern with the same content already
    * exists, the existing entry is updated (bumped usageCount, higher
    * confidence wins, refreshed lastUsedAt) instead of adding a duplicate.
+   *
+   * Returns true only when a NEW pattern was added (#3979 item 4): callers that
+   * keep a "patterns learned" counter must not count a merge or an update of an
+   * existing pattern as a newly learned one.
    */
-  store(pattern: Omit<StoredPattern, 'usageCount' | 'createdAt' | 'lastUsedAt'> & Partial<StoredPattern>): void {
+  store(pattern: Omit<StoredPattern, 'usageCount' | 'createdAt' | 'lastUsedAt'> & Partial<StoredPattern>): boolean {
     const now = Date.now();
     const stored: StoredPattern = {
       ...pattern,
@@ -568,6 +588,9 @@ class LocalReasoningBank {
       if (idx >= 0) {
         this.patternList[idx] = stored;
       }
+      this.patterns.set(pattern.id, stored);
+      this.saveToDisk();
+      return false;
     } else {
       // Check for content-duplicate before inserting a new entry
       const contentDupe = this.patternList.find(p => p.content === pattern.content);
@@ -581,7 +604,7 @@ class LocalReasoningBank {
         // Keep the Map in sync with the mutated object
         this.patterns.set(contentDupe.id, contentDupe);
         this.saveToDisk();
-        return;
+        return false;
       }
 
       // Evict oldest if at capacity
@@ -598,15 +621,26 @@ class LocalReasoningBank {
 
     // Trigger persistence (debounced)
     this.saveToDisk();
+    return true;
   }
 
   /**
-   * Find similar patterns by embedding
+   * Find similar patterns by embedding.
+   *
+   * `confidence` on each result is the pattern's own learned reliability
+   * (unchanged from storage) — NOT how well it matches this query. The
+   * per-query cosine score is returned separately as `similarity`. Callers
+   * that want "how good a semantic match is this" must read `.similarity`;
+   * callers that want "how reliable has this pattern proven to be" read
+   * `.confidence`. Prior to this fix both were conflated (confidence was
+   * overwritten with the cosine score), which silently broke any consumer
+   * that needed to tell them apart (found during the 2026-09-12 dream-cycle
+   * intelligence-surface review).
    */
   findSimilar(
     queryEmbedding: number[],
     options: { k?: number; threshold?: number; type?: string }
-  ): StoredPattern[] {
+  ): (StoredPattern & { similarity: number })[] {
     const { k = 5, threshold = 0.5, type } = options;
 
     // Filter by type if specified
@@ -629,7 +663,7 @@ class LocalReasoningBank {
         // Update usage
         s.pattern.usageCount++;
         s.pattern.lastUsedAt = Date.now();
-        return { ...s.pattern, confidence: s.score };
+        return { ...s.pattern, similarity: s.score };
       });
   }
 
@@ -763,6 +797,40 @@ let globalStats = {
   lastAdaptation: null as number | null
 };
 
+type CounterKey = 'trajectoriesRecorded' | 'patternsLearned' | 'signalsProcessed';
+
+/**
+ * Increments made by THIS process that have not yet been merged into
+ * stats.json. Persistence is delta-based: several processes (MCP server,
+ * hook one-shots, the worker daemon) share one stats.json, and each holds
+ * its own module-level globalStats. Writing the local snapshot verbatim let
+ * any writer erase every other writer's progress — notably the
+ * memory-bridge `recordSignalProcessed()` path, which persists without ever
+ * loading the file, reset `trajectoriesRecorded` to 0 on disk every 16
+ * writes. Merging deltas makes the counters monotonic across processes.
+ */
+let pendingDelta: Record<CounterKey, number> = {
+  trajectoriesRecorded: 0,
+  patternsLearned: 0,
+  signalsProcessed: 0,
+};
+let persistedStatsLoaded = false;
+
+function bumpStat(key: CounterKey, n = 1): void {
+  globalStats[key] = (globalStats[key] ?? 0) + n;
+  pendingDelta[key] += n;
+}
+
+function readStatsFile(): Partial<typeof globalStats> | null {
+  try {
+    // Read-only callers keep their unavailable-on-error contract, while invalid
+    // disk values cannot poison local state and a later repaired-file flush.
+    return readStatsForWrite(getStatsPath());
+  } catch {
+    return null;
+  }
+}
+
 // ============================================================================
 // Stats Persistence
 // ============================================================================
@@ -771,31 +839,256 @@ let globalStats = {
  * Load persisted stats from disk
  */
 function loadPersistedStats(): void {
+  persistedStatsLoaded = true;
+  const data = readStatsFile();
+  if (!data) return;
+  // #2245: previously only restored trajectoriesRecorded — patternsLearned
+  // and signalsProcessed reset to zero on every restart, masking real
+  // learning progress in the dashboards. Unsaved local increments are
+  // re-applied on top so a late load never drops them.
+  globalStats.trajectoriesRecorded = (data.trajectoriesRecorded ?? 0) + pendingDelta.trajectoriesRecorded;
+  globalStats.patternsLearned = (data.patternsLearned ?? 0) + pendingDelta.patternsLearned;
+  globalStats.signalsProcessed = (data.signalsProcessed ?? 0) + pendingDelta.signalsProcessed;
+  globalStats.lastAdaptation = maxTimestamp(data.lastAdaptation ?? null, globalStats.lastAdaptation);
+}
+
+function maxTimestamp(a: number | null, b: number | null): number | null {
+  if (a == null) return b;
+  if (b == null) return a;
+  return Math.max(a, b);
+}
+
+/** Missing files are first use; unreadable or invalid files must not be replaced. */
+function readStatsForWrite(path: string): Partial<typeof globalStats> | null {
+  let text: string;
   try {
-    const path = getStatsPath();
-    if (existsSync(path)) {
-      const data = JSON.parse(readFileSync(path, 'utf-8'));
-      if (data && typeof data === 'object') {
-        globalStats.trajectoriesRecorded = data.trajectoriesRecorded ?? 0;
-        globalStats.lastAdaptation = data.lastAdaptation ?? null;
-      }
-    }
+    text = readFileSync(path, 'utf-8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+  let data: Record<string, unknown>;
+  try {
+    data = JSON.parse(text);
   } catch {
-    // Ignore load errors, start fresh
+    throw Object.assign(new Error('Invalid learning stats JSON'), { code: 'EINVALIDSTATS' });
+  }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw Object.assign(new Error('Invalid learning stats object'), { code: 'EINVALIDSTATS' });
+  }
+  for (const key of ['trajectoriesRecorded', 'patternsLearned', 'signalsProcessed']) {
+    const value = data[key];
+    // Older files may omit a counter, but present counters must be exact counts.
+    if (value === undefined) continue;
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+      throw Object.assign(new Error(`Invalid learning stats field: ${key}`), { code: 'EINVALIDSTATS' });
+    }
+  }
+  const timestamp = data.lastAdaptation;
+  if (timestamp != null && (typeof timestamp !== 'number' || !Number.isFinite(timestamp) || timestamp < 0)) {
+    throw Object.assign(new Error('Invalid learning stats timestamp'), { code: 'EINVALIDSTATS' });
+  }
+  return data as Partial<typeof globalStats>;
+}
+
+/** Merge pending deltas under the cooperating-writer lock, then adopt committed totals. */
+function savePersistedStats(): void {
+  let statsPath: string | undefined;
+  try {
+    statsPath = join(ensureDataDir(), 'stats.json');
+    withStatsFileLock(statsPath, (path) => {
+      const disk = readStatsForWrite(path);
+      const merged = disk
+        ? {
+            trajectoriesRecorded: (disk.trajectoriesRecorded ?? 0) + pendingDelta.trajectoriesRecorded,
+            patternsLearned: (disk.patternsLearned ?? 0) + pendingDelta.patternsLearned,
+            signalsProcessed: (disk.signalsProcessed ?? 0) + pendingDelta.signalsProcessed,
+            lastAdaptation: maxTimestamp(disk.lastAdaptation ?? null, globalStats.lastAdaptation),
+          }
+        : { ...globalStats };
+      for (const key of ['trajectoriesRecorded', 'patternsLearned', 'signalsProcessed'] as const) {
+        if (!Number.isSafeInteger(merged[key]) || merged[key] < 0) {
+          throw Object.assign(new Error('Learning stats counter overflow'), { code: 'EINVALIDSTATS' });
+        }
+      }
+      if (merged.lastAdaptation != null &&
+          (!Number.isFinite(merged.lastAdaptation) || merged.lastAdaptation < 0)) {
+        throw Object.assign(new Error('Invalid merged learning stats timestamp'), { code: 'EINVALIDSTATS' });
+      }
+      const tmp = `${path}.${process.pid}.tmp`;
+      writeFileSync(tmp, JSON.stringify(merged, null, 2), 'utf-8');
+      renameSync(tmp, path);
+      // Commit local state before release: a failed release must not replay it.
+      globalStats = merged;
+      pendingDelta = { trajectoriesRecorded: 0, patternsLearned: 0, signalsProcessed: 0 };
+      persistedStatsLoaded = true;
+    });
+  } catch (error) {
+    const { code = 'UNKNOWN', path = statsPath || 'neural stats directory' } = error as NodeJS.ErrnoException;
+    // Do not print file contents, which may be malformed or user-controlled.
+    console.warn(`[intelligence] Could not persist learning stats at ${path} (${code}); pending increments retained`);
   }
 }
 
 /**
- * Save stats to disk
+ * Record a memory-bridge / hook write so `signalsProcessed` reflects real
+ * activity instead of being a permanently-zero dead metric (#2245). Throttled
+ * persistence: increments are batched (every Nth save) to avoid hitting disk
+ * on every single bridge call.
+ *
+ * Returns the new count.
  */
-function savePersistedStats(): void {
-  try {
-    ensureDataDir();
-    const path = getStatsPath();
-    writeFileSync(path, JSON.stringify(globalStats, null, 2), 'utf-8');
-  } catch {
-    // Ignore save errors
+let signalsSinceLastSave = 0;
+const SIGNAL_PERSIST_EVERY = 16;
+export function recordSignalProcessed(): number {
+  bumpStat('signalsProcessed');
+  signalsSinceLastSave++;
+  if (signalsSinceLastSave >= SIGNAL_PERSIST_EVERY) {
+    savePersistedStats();
+    signalsSinceLastSave = 0;
   }
+  return globalStats.signalsProcessed;
+}
+
+/** Force-persist current stats (e.g. before shutdown / for tests). */
+export function flushIntelligenceStats(): void {
+  savePersistedStats();
+  signalsSinceLastSave = 0;
+}
+
+// ============================================================================
+// Unified learning-stats aggregator (#2245 follow-up to ADR-074)
+// ============================================================================
+
+/**
+ * The four historical stat sources (globalStats / memory_bridge_status /
+ * hooks metrics / neural_patterns count) genuinely measure different things,
+ * so we don't merge them — we expose ONE call that returns all four sub-views
+ * with the *source path* of each, plus a `consistency` block that spot-checks
+ * the relationships the system maintains.
+ *
+ * No new store; no migration; just one honest view across the four.
+ */
+export interface UnifiedLearningStats {
+  global: {
+    patternsLearned: number;
+    trajectoriesRecorded: number;
+    signalsProcessed: number;
+    lastAdaptation: number | null;
+    source: string;
+    scope: 'project-persisted';
+  };
+  sona: {
+    trajectoriesTotal: number;
+    patternsLearned: number;
+    reasoningBankSize: number;
+    avgAdaptationTimeMs: number;
+    source: string;
+    available: boolean;
+    scope: 'process-local';
+    metric: 'recent-buffered-trajectories';
+  };
+  memoryBridge: {
+    totalEntries: number;
+    perNamespace: Record<string, number>;
+    source: string;
+    reachable: boolean;
+  };
+  neuralPatterns: {
+    patternCount: number;
+    byType: Record<string, number>;
+    modelCount: number;
+    source: string;
+  };
+  consistency: {
+    /** These counters measure different lifetimes and cannot be compared. */
+    sonaTracksGlobal: null;
+    sonaTracksGlobalDelta: null;
+    notes: string[];
+  };
+  generatedAt: string;
+}
+
+export async function getUnifiedLearningStats(): Promise<UnifiedLearningStats> {
+  const intel = getIntelligenceStats();
+  const sonaCoord = sonaCoordinator;
+  const bank = reasoningBank;
+
+  // SONA in-memory view
+  const sonaAvailable = !!sonaCoord;
+  let sonaStats = { trajectoriesTotal: 0, patternsLearned: 0, reasoningBankSize: 0, avgAdaptationTimeMs: 0 };
+  if (sonaCoord) {
+    try {
+      const s = sonaCoord.stats();
+      sonaStats = {
+        // LocalSonaCoordinator.stats() reports trajectoryCount, a bounded
+        // recent buffer. Reading nonexistent trajectoriesTotal / processed
+        // fields made this metric permanently 0, even after learning.
+        trajectoriesTotal: s.trajectoryCount,
+        patternsLearned: 0,
+        reasoningBankSize: bank?.stats().patternCount ?? 0,
+        avgAdaptationTimeMs: s.avgAdaptationMs,
+      };
+    } catch { /* SONA not yet initialised */ }
+  }
+
+  // memory-bridge
+  let bridgeStats: UnifiedLearningStats['memoryBridge'] = {
+    totalEntries: 0, perNamespace: {}, source: 'memory-bridge (skipped)', reachable: false,
+  };
+  try {
+    const mb = await import('./memory-bridge.js');
+    bridgeStats = await mb.getMemoryBridgeStats();
+  } catch { /* bridge module not loadable */ }
+
+  // neural store
+  let neuralStats: UnifiedLearningStats['neuralPatterns'] = {
+    patternCount: 0, byType: {}, modelCount: 0, source: 'neural store (skipped)',
+  };
+  try {
+    const nt = await import('../mcp-tools/neural-tools.js');
+    neuralStats = nt.getNeuralStoreStats();
+  } catch { /* neural module not loadable */ }
+
+  // SONA's coordinator is recreated on each process start, while globalStats
+  // is restored from disk. Their counts can differ by thousands after a
+  // restart even when both learning paths work correctly (#3198).
+  const notes: string[] = [];
+  if (sonaAvailable && sonaStats.trajectoriesTotal !== intel.trajectoriesRecorded) {
+    notes.push('sona.trajectoriesTotal is a process-local, bounded recent trajectory buffer; global.trajectoriesRecorded is project-persisted. These counters have different lifetimes and are not comparable.');
+  }
+  if (intel.patternsLearned > 0 && neuralStats.patternCount === 0) {
+    notes.push(`globalStats reports ${intel.patternsLearned} patterns learned but neural_patterns store is empty — pretrain has not written here, or trajectory-end isn't promoting patterns to the neural store yet`);
+  }
+  if (!bridgeStats.reachable) {
+    notes.push('memory-bridge unreachable — bridge-dependent counters (post-edit/-command persistence, pretrain bundle) will show 0');
+  }
+
+  return {
+    global: {
+      patternsLearned: intel.patternsLearned,
+      trajectoriesRecorded: intel.trajectoriesRecorded,
+      signalsProcessed: intel.signalsProcessed,
+      lastAdaptation: intel.lastAdaptation,
+      source: '.claude-flow/neural/stats.json (globalStats)',
+      scope: 'project-persisted',
+    },
+    sona: {
+      ...sonaStats,
+      source: 'sonaCoordinator (in-memory, resets per process)',
+      available: sonaAvailable,
+      scope: 'process-local',
+      metric: 'recent-buffered-trajectories',
+    },
+    memoryBridge: bridgeStats,
+    neuralPatterns: neuralStats,
+    consistency: {
+      sonaTracksGlobal: null,
+      sonaTracksGlobalDelta: null,
+      notes,
+    },
+    generatedAt: new Date().toISOString(),
+  };
 }
 
 // ============================================================================
@@ -927,7 +1220,7 @@ export async function recordStep(step: TrajectoryStep): Promise<boolean> {
       globalStats.lastAdaptation = Date.now();
     }
 
-    globalStats.trajectoriesRecorded++;
+    bumpStat('trajectoriesRecorded');
     savePersistedStats();
     return true;
   } catch {
@@ -978,7 +1271,7 @@ export async function recordTrajectory(
       if (verdict === 'success') {
         for (const step of enrichedSteps) {
           if (step.embedding && step.embedding.length > 0) {
-            reasoningBank.store({
+            const added = reasoningBank.store({
               id: `pattern-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
               type: step.type,
               content: step.content,
@@ -987,7 +1280,10 @@ export async function recordTrajectory(
               metadata: step.metadata || {},
               createdAt: Date.now(),
             });
-            globalStats.patternsLearned++;
+            // #3979 item 4: count only patterns that were actually added. A step
+            // whose content already exists is merged into that pattern, so the
+            // counter no longer climbs once per successful step.
+            if (added) bumpStat('patternsLearned');
           }
         }
       }
@@ -1000,20 +1296,22 @@ export async function recordTrajectory(
         const avgQuality = verdict === 'success' ? 1.0 : verdict === 'partial' ? 0.5 : 0.0;
         ruvllmCoord.recordTrajectory({
           steps: enrichedSteps.map(s => ({
-            state: s.content,
-            action: s.type,
-            reward: avgQuality,
-            embedding: s.embedding || []
+            type: ['query', 'route', 'generate', 'memory', 'feedback'].includes(s.type)
+              ? s.type : 'generate',
+            input: s.content,
+            output: '',
+            durationMs: 0,
+            confidence: avgQuality
           })),
           totalReward: avgQuality,
-          success: verdict === 'success'
+          outcome: verdict
         });
       } catch {
         // ruvllm recording failed silently
       }
     }
 
-    globalStats.trajectoriesRecorded++;
+    bumpStat('trajectoriesRecorded');
     globalStats.lastAdaptation = Date.now();
     savePersistedStats();
 
@@ -1077,7 +1375,7 @@ export async function findSimilarPatterns(
       usageCount: r.usageCount,
       createdAt: r.createdAt,
       lastUsedAt: r.lastUsedAt,
-      similarity: (r as unknown as { similarity?: number }).similarity ?? r.confidence ?? 0.5
+      similarity: r.similarity
     }));
   } catch {
     return [];
@@ -1104,17 +1402,35 @@ export function getIntelligenceStats(): IntelligenceStats & {
   if (!ruvllmLoaded) {
     loadRuvllmCoordinatorSync();
   }
+  // A read-only status process (ruvllm_status, `neural status`, a fresh MCP
+  // server) has never run initializeIntelligence(); without this it reported
+  // 0 trajectories no matter what other processes had persisted.
+  if (!persistedStatsLoaded) {
+    loadPersistedStats();
+  }
   const ruvllmStats = ruvllmCoordinator?.stats?.() || null;
 
-  // Fetch cross-module stats for unified reporting
+  // Fetch cross-module stats for unified reporting.
+  //
+  // #2549 — two prior defects here: `trainingBackend` was declared and
+  // returned but never assigned (always 'unavailable'), and contrastive
+  // availability was read ONLY from an in-process global that a fresh
+  // read-only `neural status` process never populates. Both made the
+  // native @ruvector/ruvllm path invisible even when installed. Backend
+  // now comes from the lora-adapter's capability probe; the global still
+  // wins when present because it carries live in-process session counts.
   let contrastiveTrainer: { triplets: number; agents: number } | string = 'unavailable';
   let trainingBackend = 'unavailable';
   try {
-    // Synchronous check — contrastiveTrainer is module-level in sona-optimizer
-    // We read it via the SONAOptimizer singleton if available
+    trainingBackend = resolveTrainingBackend();
+  } catch { /* module absent — stay 'unavailable' */ }
+  try {
     const sonaModule = (globalThis as any).__claudeFlowSonaStats;
-    if (sonaModule) {
-      contrastiveTrainer = sonaModule._contrastiveTrainer || 'unavailable';
+    if (sonaModule?._contrastiveTrainer) {
+      contrastiveTrainer = sonaModule._contrastiveTrainer;
+    } else if (trainingBackend === 'ruvllm') {
+      // Module resolves but no in-process session — available, idle.
+      contrastiveTrainer = 'available';
     }
   } catch { /* not available */ }
 
@@ -1210,6 +1526,10 @@ export function clearIntelligence(): void {
     signalsProcessed: 0,
     lastAdaptation: null
   };
+  pendingDelta = { trajectoriesRecorded: 0, patternsLearned: 0, signalsProcessed: 0 };
+  // In-memory reset only: stay "loaded" so the next stats read does not
+  // immediately re-hydrate the counters this call just cleared.
+  persistedStatsLoaded = true;
 }
 
 /**

@@ -46,9 +46,15 @@ Phase 1 enforces at the **send** side. Phase 2 (peer state machine: ACTIVE / SUS
 
 | Command | Description |
 |---------|-------------|
-| `/federation-init` | Generate keypair and initialize federation on this node |
-| `/federation-status` | Show peers, sessions, trust levels, and health |
-| `/federation-audit` | Query structured audit logs with compliance filtering |
+| `/federation <subcommand>` | Dispatcher for `init`, `join`, `leave`, `peers`, `send`, `status`, `audit`, `trust`, `config` (see [`commands/federation.md`](commands/federation.md)) |
+
+## Skills (auto-invoked by description)
+
+| Skill | When it triggers |
+|-------|------------------|
+| `federation-init` | Initialize this node — generate keypair and configure peers |
+| `federation-status` | "is federation healthy?", "show peers", "federation status" |
+| `federation-audit` | Query audit logs with compliance / severity / date filters |
 
 ## Agents
 
@@ -91,9 +97,20 @@ This plugin owns the `federation` AgentDB namespace. This is the documented exce
 
 ```bash
 bash plugins/ruflo-federation/scripts/smoke.sh
-# Expected: "10 passed, 0 failed"
+# Expected: "13 passed, 0 failed"
 ```
 
 ## Architecture Decisions
 
 - [`ADR-0001` — ruflo-federation plugin contract (3-gate alignment, ADR-097 budget integration, namespace coordination, smoke as contract)](./docs/adrs/0001-federation-contract.md)
+
+## As a mod
+
+Since this version the plugin is also a function-hook mod (ADR-445 pattern; needs Claude Code 2.1.287 or later). It never calls the network or spawns a process, and it only tightens: it can refuse a call, never allow one.
+
+- **Guard** (default on): refuses outbound federation calls (`x_federation_publish`, `x_federation_channel_publish`, `x_federation_sync`, `federation_bbs_publish`, `federation_bbs_sync`, and `federation`-namespace memory writes) that hold a key, token or password or personal data (an SSN or a Luhn-valid card number). The reason names the kind of secret, never the value.
+- **`/federation-mod`**: answered locally, no model turn: `status`, `scan <text>` (would the guard refuse this?), and `tools` (the connected federation tools).
+- **Status file**: `.claude-flow/federation-mod/status.json` (`{version, updatedMs, guard, blocked}`), written at session start and when a call is blocked.
+- **Option**: `guard` (`on` | `off`, default `on`) in the plugin's `userConfig`.
+
+Test it: `claude plugin test plugins/ruflo-federation` and `bash plugins/ruflo-federation/scripts/smoke.sh`.

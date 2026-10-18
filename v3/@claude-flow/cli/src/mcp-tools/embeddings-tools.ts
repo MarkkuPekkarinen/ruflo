@@ -20,6 +20,14 @@ interface EmbeddingsConfig {
   modelPath: string;
   dimension: number;
   cacheSize: number;
+  /**
+   * #3376 — whether a model was actually downloaded into `modelPath`.
+   * Optional: configs written before this field existed omit it, and
+   * `undefined` means "unknown", not "false". `embeddings init` (CLI) sets it.
+   */
+  modelDownloaded?: boolean;
+  /** #3376 — why no model was downloaded, when `modelDownloaded` is false. */
+  modelSkipReason?: string;
   hyperbolic: {
     enabled: boolean;
     curvature: number;
@@ -91,13 +99,23 @@ async function getRealEmbeddingFunction() {
 }
 
 // Generate real ONNX embedding (falls back to deterministic hash if ONNX unavailable)
-async function generateRealEmbedding(text: string, dimension: number): Promise<number[]> {
+type EmbeddingResult = {
+  embedding: number[];
+  backend: 'onnx' | 'mock';
+  model: string;
+};
+
+async function generateRealEmbedding(text: string, dimension: number): Promise<EmbeddingResult> {
   const realFn = await getRealEmbeddingFunction();
 
   if (realFn) {
     try {
       const result = await realFn(text);
-      return result.embedding;
+      return {
+        embedding: result.embedding,
+        backend: (result as { backend?: 'onnx' | 'mock' }).backend ?? 'onnx',
+        model: result.model,
+      };
     } catch {
       // Fall through to fallback
     }
@@ -118,7 +136,11 @@ async function generateRealEmbedding(text: string, dimension: number): Promise<n
 
   // L2 normalize
   const norm = Math.sqrt(embedding.reduce((sum, x) => sum + x * x, 0));
-  return embedding.map(x => x / norm);
+  return {
+    embedding: embedding.map(x => x / norm),
+    backend: 'mock',
+    model: 'hash-fallback',
+  };
 }
 
 // Convert Euclidean embedding to Poincaré ball
@@ -132,19 +154,34 @@ function toPoincare(euclidean: number[], curvature: number): number[] {
   return euclidean.map(x => x * factor);
 }
 
-// Poincaré distance
+// #4159: a point is usable only strictly inside the ball of radius 1/sqrt(c).
+function insidePoincareBall(p: number[], curvature: number): boolean {
+  const c = Math.abs(curvature);
+  return c * p.reduce((sum, x) => sum + x * x, 0) < 1;
+}
+
+// Poincaré distance, d_c(a,b) = acosh(1 + 2c|a-b|^2 / ((1-c|a|^2)(1-c|b|^2))) / sqrt(c).
+// Returns NaN for a point on or outside the ball (the formula is undefined there);
+// callers must check Number.isFinite before reporting it.
 function poincareDistance(a: number[], b: number[], curvature: number): number {
   const c = Math.abs(curvature);
+  if (a.length !== b.length || !insidePoincareBall(a, curvature) || !insidePoincareBall(b, curvature)) {
+    return NaN;
+  }
 
   const diffSq = a.reduce((sum, _, i) => sum + (a[i] - b[i]) ** 2, 0);
   const normASq = a.reduce((sum, x) => sum + x * x, 0);
   const normBSq = b.reduce((sum, x) => sum + x * x, 0);
 
-  const denom = (1 - normASq) * (1 - normBSq);
-  const delta = 2 * diffSq / (denom + 1e-15);
+  const denom = (1 - c * normASq) * (1 - c * normBSq);
+  const delta = (2 * c * diffSq) / denom;
 
   return (1 / Math.sqrt(c)) * Math.acosh(1 + delta);
 }
+
+const HYPERBOLIC_RADIUS_NOTE =
+  'convert is an exponential map at the origin: it preserves the input norm ordering, so unit-norm text embeddings all land at the same radius. ' +
+  'It does not encode hierarchy; depth/tree structure has to come from the hierarchy itself (for example depth chosen as the radius, or embeddings trained on the tree edges).';
 
 // Cosine similarity
 function cosineSimilarity(a: number[], b: number[]): number {
@@ -296,7 +333,8 @@ export const embeddingsTools: MCPTool[] = [
       const useHyperbolic = input.hyperbolic === true && config.hyperbolic.enabled;
 
       // Generate real ONNX embedding
-      const embedding = await generateRealEmbedding(text, config.dimension);
+      const generated = await generateRealEmbedding(text, config.dimension);
+      const embedding = generated.embedding;
 
       let result: number[];
       let geometry: string;
@@ -314,6 +352,8 @@ export const embeddingsTools: MCPTool[] = [
         embedding: result,
         metadata: {
           model: config.model,
+          embeddingBackend: generated.backend,
+          semanticGrounded: generated.backend === 'onnx',
           dimension: config.dimension,
           geometry,
           curvature: useHyperbolic ? config.hyperbolic.curvature : null,
@@ -365,10 +405,14 @@ export const embeddingsTools: MCPTool[] = [
       { const v = validateText(text2, 'text2'); if (!v.valid) return { success: false, error: v.error }; }
 
       // Generate real ONNX embeddings for both texts
-      const [emb1, emb2] = await Promise.all([
+      const [generated1, generated2] = await Promise.all([
         generateRealEmbedding(text1, config.dimension),
         generateRealEmbedding(text2, config.dimension)
       ]);
+      const emb1 = generated1.embedding;
+      const emb2 = generated2.embedding;
+      const embeddingBackend =
+        generated1.backend === 'onnx' && generated2.backend === 'onnx' ? 'onnx' : 'mock';
 
       let similarity: number;
       let distance: number;
@@ -384,6 +428,9 @@ export const embeddingsTools: MCPTool[] = [
           const poinc1 = toPoincare(emb1, config.hyperbolic.curvature);
           const poinc2 = toPoincare(emb2, config.hyperbolic.curvature);
           distance = poincareDistance(poinc1, poinc2, config.hyperbolic.curvature);
+          if (!Number.isFinite(distance)) {
+            return { success: false, error: 'Hyperbolic distance is undefined for these inputs (a converted point reached the ball boundary).' };
+          }
           similarity = 1 / (1 + distance);
           break;
 
@@ -402,14 +449,21 @@ export const embeddingsTools: MCPTool[] = [
         similarity,
         distance,
         metric,
+        embeddingBackend,
+        semanticGrounded: embeddingBackend === 'onnx',
         texts: {
           text1: { length: text1.length, preview: text1.slice(0, 50) },
           text2: { length: text2.length, preview: text2.slice(0, 50) },
         },
-        interpretation: similarity > 0.8 ? 'very similar' :
-                        similarity > 0.6 ? 'similar' :
-                        similarity > 0.4 ? 'somewhat similar' :
-                        similarity > 0.2 ? 'different' : 'very different',
+        interpretation: embeddingBackend === 'onnx'
+          ? similarity > 0.8 ? 'very similar'
+            : similarity > 0.6 ? 'similar'
+            : similarity > 0.4 ? 'somewhat similar'
+            : similarity > 0.2 ? 'different' : 'very different'
+          : null,
+        warning: embeddingBackend === 'mock'
+          ? 'Hash fallback scores are deterministic but not semantically meaningful.'
+          : undefined,
       };
     },
   },
@@ -487,6 +541,8 @@ export const embeddingsTools: MCPTool[] = [
           })),
           metadata: {
             model: config.model,
+            embeddingBackend: queryEmbedding.backend,
+            semanticGrounded: queryEmbedding.backend === 'onnx',
             topK,
             threshold,
             namespace: namespace || 'all',
@@ -494,6 +550,9 @@ export const embeddingsTools: MCPTool[] = [
             indexType: config.hyperbolic.enabled ? 'HNSW (hyperbolic)' : 'HNSW (euclidean)',
             resultCount: searchResult.results.length
           },
+          warning: queryEmbedding.backend === 'mock'
+            ? 'Results use a hash fallback and are not semantically ranked.'
+            : undefined,
         };
       } catch {
         // Database not available - return empty but truthful
@@ -504,12 +563,17 @@ export const embeddingsTools: MCPTool[] = [
           results: [],
           metadata: {
             model: config.model,
+            embeddingBackend: queryEmbedding.backend,
+            semanticGrounded: queryEmbedding.backend === 'onnx',
             topK,
             threshold,
             namespace: namespace || 'all',
             searchTime: `${searchTime}ms`,
             indexType: config.hyperbolic.enabled ? 'HNSW (hyperbolic)' : 'HNSW (euclidean)',
           },
+          warning: queryEmbedding.backend === 'mock'
+            ? 'Hash fallback is active; semantic search is unavailable.'
+            : undefined,
           message: 'No embeddings indexed yet. Use memory store to add documents.',
         };
       }
@@ -776,6 +840,7 @@ export const embeddingsTools: MCPTool[] = [
             poincare,
             curvature,
             poincareNorm: Math.sqrt(poincare.reduce((sum, x) => sum + x * x, 0)),
+            note: HYPERBOLIC_RADIUS_NOTE,
           };
 
         case 'distance':
@@ -785,6 +850,13 @@ export const embeddingsTools: MCPTool[] = [
             return { success: false, error: 'embedding1 and embedding2 required for distance action' };
           }
           const dist = poincareDistance(emb1, emb2, curvature);
+          if (!Number.isFinite(dist)) {
+            return {
+              success: false,
+              error: 'Poincaré distance needs two points of equal length strictly inside the ball (|x| < 1/sqrt(c)); got a point on or outside it, or mismatched lengths. Run convert on Euclidean vectors first.',
+              curvature,
+            };
+          }
           return {
             success: true,
             action: 'distance',
@@ -820,11 +892,10 @@ export const embeddingsTools: MCPTool[] = [
               epsilon: config.hyperbolic.epsilon,
               maxNorm: config.hyperbolic.maxNorm,
             },
+            note: HYPERBOLIC_RADIUS_NOTE,
             benefits: [
-              'Better hierarchical data representation',
-              'Exponential capacity in low dimensions',
-              'Preserves tree-like structures',
-              'Natural for taxonomy embeddings',
+              'Exponential capacity in low dimensions when the points are placed by hierarchy (for example by depth)',
+              'Natural geometry for taxonomy embeddings that are trained or constructed for it',
             ],
           };
       }
@@ -866,6 +937,8 @@ export const embeddingsTools: MCPTool[] = [
       } catch { /* not installed */ }
 
       const ruvectorEnabled = config.neural.ruvector?.enabled ?? false;
+      const backendProbe = await generateRealEmbedding('ruflo embedding backend probe', config.dimension);
+      const semanticGrounded = backendProbe.backend === 'onnx';
 
       return {
         success: true,
@@ -894,11 +967,20 @@ export const embeddingsTools: MCPTool[] = [
           models: config.modelPath,
         },
         initializedAt: config.initialized,
+        embeddingBackend: backendProbe.backend,
+        semanticGrounded,
+        warning: semanticGrounded
+          ? undefined
+          : 'Hash fallback is active. Similarity scores are deterministic but not semantically meaningful.',
         capabilities: {
           onnxModels: ['Xenova/all-MiniLM-L6-v2', 'Xenova/all-mpnet-base-v2'],
           geometries: ['euclidean', 'poincare'],
           normalizations: ['L2', 'L1', 'minmax', 'zscore'],
-          features: ['semantic search', 'hyperbolic projection', 'neural substrate'],
+          features: [
+            ...(semanticGrounded ? ['semantic search'] : []),
+            'hyperbolic projection',
+            'neural substrate',
+          ],
         },
       };
     },

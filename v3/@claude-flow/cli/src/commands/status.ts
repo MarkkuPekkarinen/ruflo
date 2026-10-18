@@ -44,9 +44,26 @@ function getProcessMemoryUsage(): number {
 }
 
 // Check if project is initialized
+//
+// #2120 — the old check required `.claude-flow/config.yaml`, which
+// missed projects that were initialized via `ruflo memory init` (writes
+// `.swarm/memory.db` but no config.yaml) or via the auto-memory bridge.
+// Reporter @alexandrelealbess on WSL2 had a 251-entry `.swarm/memory.db`
+// and a running MCP, yet `ruflo status` reported "not initialized".
+//
+// Now: any of these signals counts as initialized:
+//   - `.claude-flow/config.yaml`   (the canonical `ruflo init` output)
+//   - `.claude-flow/config.json`   (same, alt format)
+//   - `.swarm/memory.db`           (the `ruflo memory init` output)
+//   - `.claude/settings.json`      (the Claude Code hook surface)
 function isInitialized(cwd: string): boolean {
-  const configPath = path.join(cwd, '.claude-flow', 'config.yaml');
-  return fs.existsSync(configPath);
+  const candidates = [
+    path.join(cwd, '.claude-flow', 'config.yaml'),
+    path.join(cwd, '.claude-flow', 'config.json'),
+    path.join(cwd, '.swarm', 'memory.db'),
+    path.join(cwd, '.claude', 'settings.json'),
+  ];
+  return candidates.some((p) => fs.existsSync(p));
 }
 
 // Format uptime
@@ -504,14 +521,13 @@ const agentsCommand: Command = {
     try {
       const result = await callMCPTool<{
         agents: Array<{
-          id: string;
-          type: string;
+          agentId: string;
+          agentType: string;
           status: string;
-          task?: string;
-          uptime: number;
-          metrics: { tasksCompleted: number; successRate: number };
+          health: number;
+          taskCount: number;
         }>;
-      }>('agent_list', { includeMetrics: true, status: 'all' });
+      }>('agent_list', {});
 
       if (ctx.flags.format === 'json') {
         output.printJson(result);
@@ -523,7 +539,7 @@ const agentsCommand: Command = {
       output.writeln();
 
       if (result.agents.length === 0) {
-        output.printInfo('No agents running');
+        output.printInfo('No agents registered');
         return { success: true, data: result };
       }
 
@@ -532,17 +548,15 @@ const agentsCommand: Command = {
           { key: 'id', header: 'ID', width: 20 },
           { key: 'type', header: 'Type', width: 12 },
           { key: 'status', header: 'Status', width: 10 },
-          { key: 'task', header: 'Current Task', width: 25 },
-          { key: 'uptime', header: 'Uptime', width: 12 },
-          { key: 'success', header: 'Success', width: 8 }
+          { key: 'tasks', header: 'Tasks', width: 8 },
+          { key: 'health', header: 'Health', width: 8 }
         ],
         data: result.agents.map(a => ({
-          id: a.id,
-          type: a.type,
+          id: a.agentId,
+          type: a.agentType,
           status: formatHealth(a.status),
-          task: a.task || '-',
-          uptime: formatUptime(a.uptime),
-          success: `${(a.metrics.successRate * 100).toFixed(0)}%`
+          tasks: a.taskCount,
+          health: a.health
         }))
       });
 

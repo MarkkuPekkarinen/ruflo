@@ -12,38 +12,20 @@
 //   TRACK_DRY_RUN=1           skip the memory_store call
 //   TRACK_QUIET=1             suppress markdown summary
 //   TRACK_NAMESPACE=<name>    override (default: cost-tracking)
+//
+// A real persistToMemory() failure (not TRACK_DRY_RUN) is also appended to
+// the shared diagnostic log (_diagnostic-log.cjs, #3227) before TRACK_QUIET
+// suppresses the markdown summary that would otherwise be the only trace.
 
 import { readFileSync, writeFileSync, readdirSync, statSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { spawnSync } from 'node:child_process';
+import { spawnNpxSync } from './_npx.mjs';
+import { logFailure } from './_diagnostic-log.cjs';
+// iter 68 — shared PRICING table (was duplicated in counterfactual.mjs too).
+import { modelTier, costForUsage } from './_prices.mjs';
 
 const PROJECTS_DIR = join(homedir(), '.claude', 'projects');
-
-// USD per 1M tokens — kept in sync with REFERENCE.md "Model pricing" table.
-const PRICING = {
-  haiku:  { input: 0.25,  output: 1.25,  cache_write: 0.30,  cache_read: 0.03 },
-  sonnet: { input: 3.00,  output: 15.00, cache_write: 3.75,  cache_read: 0.30 },
-  opus:   { input: 15.00, output: 75.00, cache_write: 18.75, cache_read: 1.50 },
-};
-
-function modelTier(model) {
-  if (!model) return 'unknown';
-  const m = String(model).toLowerCase();
-  if (m.includes('haiku')) return 'haiku';
-  if (m.includes('sonnet')) return 'sonnet';
-  if (m.includes('opus')) return 'opus';
-  return 'unknown';
-}
-
-function costForUsage(tier, usage) {
-  const p = PRICING[tier];
-  if (!p || !usage) return 0;
-  return (usage.input_tokens || 0) / 1e6 * p.input
-       + (usage.output_tokens || 0) / 1e6 * p.output
-       + (usage.cache_creation_input_tokens || 0) / 1e6 * p.cache_write
-       + (usage.cache_read_input_tokens || 0) / 1e6 * p.cache_read;
-}
 
 function encodeProjectPath(cwd) {
   // #1927: Claude Code encodes an absolute path by replacing path separators
@@ -127,7 +109,7 @@ function persistToMemory(summary) {
     ? '@claude-flow/cli-core@alpha'
     : '@claude-flow/cli@latest';
   // spawnSync with explicit args avoids shell-escape pitfalls for the JSON value.
-  const r = spawnSync('npx', [
+  const r = spawnNpxSync([
     cliPkg, 'memory', 'store',
     '--namespace', ns,
     '--key', key,
@@ -162,6 +144,9 @@ function main() {
   let storeResult = { ok: false, reason: 'dry-run' };
   if (process.env.TRACK_DRY_RUN !== '1') {
     storeResult = persistToMemory(summary);
+    if (!storeResult.ok) {
+      logFailure({ source: 'track.mjs', reason: storeResult.reason, sessionId: summary.sessionId });
+    }
   }
 
   if (process.env.TRACK_QUIET === '1') return;

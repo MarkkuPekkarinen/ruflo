@@ -19,9 +19,11 @@ import { dirname, join } from 'path';
 import type { Command, CommandContext, CommandResult, V3Config, CLIError } from './types.js';
 import { CommandParser, commandParser } from './parser.js';
 import { OutputFormatter, output } from './output.js';
+import { resolveTargetCommand } from './command-resolution.js';
 import { commands, commandsByCategory, getCommandsByCategory, commandRegistry, getCommand, getCommandAsync, getCommandNames, getLazyCommandNames, hasCommand } from './commands/index.js';
 import { suggestCommand } from './suggest.js';
 import { runStartupUpdateCheck } from './update/index.js';
+import { ensureBlockingStdio } from './blocking-stdio.js';
 
 // Read version from package.json at runtime
 function getPackageVersion(): string {
@@ -82,6 +84,8 @@ export class CLI {
    * Run the CLI with given arguments
    */
   async run(args: string[] = process.argv.slice(2)): Promise<void> {
+    // #3851: keep piped output intact across the process.exit() calls below
+    ensureBlockingStdio();
     try {
       // #1791.2 — If the user invoked a lazy command (e.g. `hive-mind task`),
       // pre-load it BEFORE parsing so the parser can build scoped flag
@@ -104,13 +108,13 @@ export class CLI {
       const { command: commandPath, flags, positional } = parseResult;
 
       // Handle global flags
+      if (flags.noColor || flags.color === false) {
+        this.output.setColorEnabled(false);
+      }
+
       if (flags.version || flags.V) {
         this.showVersion();
         return;
-      }
-
-      if (flags.noColor) {
-        this.output.setColorEnabled(false);
       }
 
       // Set verbosity level based on flags
@@ -129,8 +133,103 @@ export class CLI {
       }
 
       // Run startup update check (non-blocking, silent on skip)
-      if (!flags.noUpdate && commandPath[0] !== 'update') {
+      if (!flags.noUpdate && flags.update !== false && commandPath[0] !== 'update' && !(commandPath[0] === 'doctor' && flags.json)) {
         this.checkForUpdatesOnStartup().catch(() => {/* silent */});
+      }
+
+      // Version-stamped helper auto-refresh — propagate hook fixes to an already
+      // initialized project without a manual re-init. Skip for init/upgrade
+      // (they refresh explicitly). AWAITED (not fire-and-forget) so a fast
+      // command can't exit before the copy lands; the fast path is a single
+      // stamp read + string compare (sub-ms), and the copy runs at most once per
+      // version bump. Best-effort + silent — never blocks or fails a command.
+      if (commandPath[0] !== 'init' && commandPath[0] !== 'update') {
+        // ADR-324: existing installations acquire a versioned policy state on
+        // first use. Migration is additive and starts in legacy mode, so older
+        // AgentDB, MCP, hooks, and swarm workflows keep their exact behavior.
+        try {
+          const { autoMigratePolicyStateIfNeeded } = await import('./services/policy-runtime.js');
+          const migration = await autoMigratePolicyStateIfNeeded(process.cwd());
+          if (migration.migrated && this.output.isVerbose()) {
+            this.output.printDebug(`Initialized agentic policy compatibility state (${migration.mode})`);
+          }
+        } catch (error) {
+          // Legacy compatibility requires startup to remain available if the
+          // policy state cannot be initialized. Enforce-mode actions still
+          // fail at their authoritative dispatcher when state is unreadable.
+          if (this.output.isVerbose()) {
+            this.output.printDebug(`Policy compatibility migration skipped: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+
+        try {
+          const { autoRefreshHelpersIfStale } = await import('./init/helper-refresh.js');
+          // alsoRefreshGlobal:true — refresh ~/.claude/helpers too, not just
+          // <cwd>/.claude/helpers. Fixes the "promo row missing on remote
+          // installs" bug where Claude Code's global settings.json falls back
+          // to ~/.claude/helpers/statusline.cjs (executor.ts:460-462) and that
+          // file was frozen at whatever version was current when the user
+          // last ran `ruflo init` — pre-3.31.3 nothing refreshed it, so any
+          // helpers change (e.g. the 2026-07-13 Line-3 funnel row addition)
+          // never reached existing installs. Same forward-only semver.gte
+          // guard applies to the global pass.
+          const r = await autoRefreshHelpersIfStale(process.cwd(), { alsoRefreshGlobal: true });
+          if (r.blocked) {
+            // Integrity failure = potential on-disk tampering of hook code. Warn
+            // loudly (not silent) — the existing project helpers were left intact.
+            this.output.printWarning(`Skipped helper auto-refresh — ${r.blocked}. Reinstall @claude-flow/cli from a trusted source.`);
+          } else if (r.healed) {
+            // #3565: a critical helper's stamp matched but its on-disk content
+            // didn't hash-match the signed manifest — restored, but always
+            // surfaced (not verbose-gated like a routine version-bump refresh).
+            this.output.printWarning(`Detected tampered critical helper(s) in .claude/helpers (${(r.tampered || []).join(', ')}) — restored verified content from the installed package. If this wasn't expected, find out what modified them.`);
+          } else if (r.refreshed && this.output.isVerbose()) {
+            this.output.printDebug(`Refreshed .claude/helpers (${r.from} → ${r.to})`);
+          }
+          if (r.global?.healed) {
+            this.output.printWarning(`Detected tampered critical helper(s) in ~/.claude/helpers (${(r.global.tampered || []).join(', ')}) — restored verified content.`);
+          } else if (r.global?.refreshed && this.output.isVerbose()) {
+            this.output.printDebug(`Refreshed ~/.claude/helpers (${r.global.from} → ${r.global.to})`);
+          } else if (r.global?.blocked && r.global.blocked !== r.blocked) {
+            this.output.printWarning(`Skipped ~/.claude/helpers auto-refresh — ${r.global.blocked}.`);
+          }
+        } catch { /* silent */ }
+
+        // ADR-177: adopt a signed proven-configuration champion if the package
+        // ships one newer than this project's stamp AND it is authentic +
+        // suitable for this environment. Sibling of the helper channel above —
+        // its own stamp + trust root; additive no-op when no champion ships.
+        try {
+          const { autoAdoptProvenConfigIfStale } = await import('./config/proven-config-refresh.js');
+          const a = await autoAdoptProvenConfigIfStale(process.cwd());
+          if (a.adopted && this.output.isVerbose()) {
+            this.output.printDebug(`Adopted proven config (${a.from} → ${a.to})`);
+          }
+          // Close the loop (ADR-176 phase 9): promote the adopted champion to the
+          // ACTIVE policy that consumers (neural_patterns retrieval, …) read. A
+          // no-op if nothing is adopted or it is already active; reversible.
+          const { applyChampion } = await import('./config/harness-feedback-applier.js');
+          const ap = applyChampion(process.cwd());
+          if (ap.applied && this.output.isVerbose()) {
+            this.output.printDebug(`Applied proven config to active policy (${ap.from ?? '(none)'} → ${ap.to})`);
+          }
+        } catch { /* silent */ }
+
+        // Self-running daemon: ensure the background workers (distillation,
+        // backup, …) are actually firing without a manual `daemon start`.
+        // Single-instance (only spawns when none is alive; the spawned daemon
+        // re-checks its own lock), bounded (TTL/idle self-shutdown), opt-out via
+        // RUFLO_DAEMON_AUTOSTART=0. Skipped for `daemon` (no recursion). Detached
+        // + fire-and-forget, so it never blocks the command.
+        if (commandPath[0] !== 'daemon') {
+          try {
+            const { ensureDaemonRunning } = await import('./services/daemon-autostart.js');
+            const d = ensureDaemonRunning(process.cwd());
+            if (d.started) {
+              this.output.printInfo(`Started Ruflo background daemon for ${process.cwd()} (stop: ruflo daemon stop)`);
+            }
+          } catch { /* silent */ }
+        }
       }
 
       // Handle lazy-loaded commands that weren't recognized by the parser
@@ -185,60 +284,11 @@ export class CLI {
         process.exit(1);
       }
 
-      // Handle subcommand (supports nested subcommands)
-      let targetCommand = command;
-      let subcommandArgs = positional;
-
-      // Process command path (e.g., ['hooks', 'worker', 'list'])
-      // Note: When parser includes subcommand in commandPath, positional already excludes it
-      if (commandPath.length > 1 && command.subcommands) {
-        const subcommandName = commandPath[1];
-        const subcommand = command.subcommands.find(
-          sc => sc.name === subcommandName || sc.aliases?.includes(subcommandName)
-        );
-
-        if (subcommand) {
-          targetCommand = subcommand;
-          // Parser already extracted subcommand from positional, so use as-is
-          subcommandArgs = positional;
-
-          // Check for nested subcommand (level 2)
-          if (commandPath.length > 2 && subcommand.subcommands) {
-            const nestedName = commandPath[2];
-            const nestedSubcommand = subcommand.subcommands.find(
-              sc => sc.name === nestedName || sc.aliases?.includes(nestedName)
-            );
-            if (nestedSubcommand) {
-              targetCommand = nestedSubcommand;
-              // Parser already extracted nested subcommand too
-              subcommandArgs = positional;
-            }
-          }
-        }
-      } else if (positional.length > 0 && command.subcommands) {
-        // Check if first positional is a subcommand
-        const subcommandName = positional[0];
-        const subcommand = command.subcommands.find(
-          sc => sc.name === subcommandName || sc.aliases?.includes(subcommandName)
-        );
-
-        if (subcommand) {
-          targetCommand = subcommand;
-          subcommandArgs = positional.slice(1);
-
-          // Check for nested subcommand (level 2 from positional)
-          if (subcommandArgs.length > 0 && subcommand.subcommands) {
-            const nestedName = subcommandArgs[0];
-            const nestedSubcommand = subcommand.subcommands.find(
-              sc => sc.name === nestedName || sc.aliases?.includes(nestedName)
-            );
-            if (nestedSubcommand) {
-              targetCommand = nestedSubcommand;
-              subcommandArgs = subcommandArgs.slice(1);
-            }
-          }
-        }
-      }
+      // Handle subcommands at any depth (#4157): walk the parsed command path, or the
+      // positional arguments when the path only names the top-level command.
+      const resolved = resolveTargetCommand(command, commandPath, positional);
+      const targetCommand = resolved.target;
+      const subcommandArgs = resolved.args;
 
       // Validate flags
       const validationErrors = this.parser.validateFlags(flags, targetCommand);
@@ -537,7 +587,7 @@ export class CLI {
     } catch (error) {
       // Config loading is optional - don't fail if it doesn't exist
       if (process.env.DEBUG) {
-        this.output.writeln(
+        this.output.writeErrorln(
           this.output.dim(`Config loading failed: ${(error as Error).message}`)
         );
       }
@@ -607,6 +657,8 @@ export {
 // Memory & Intelligence (V3 Performance Features)
 export {
   initializeMemoryDatabase,
+  repairVectorIndexes,
+  recoverMemoryDatabase,
   generateEmbedding,
   generateBatchEmbeddings,
   storeEntry,
