@@ -260,13 +260,29 @@ function loadLegacyStore(): LegacyMemoryStore | null {
 /**
  * Mark migration as complete
  */
-function markMigrationComplete(): void {
+function markMigrationComplete(counts?: { migrated: number; total: number }): void {
   const legacyDir = resolve(LEGACY_MEMORY_DIR);
   if (!existsSync(legacyDir)) mkdirSync(legacyDir, { recursive: true });
   writeFileSync(resolve(join(LEGACY_MEMORY_DIR, MIGRATION_MARKER)), JSON.stringify({
     migratedAt: new Date().toISOString(),
     version: '3.0.0',
+    ...(counts ?? {}),
   }), 'utf-8');
+}
+
+/**
+ * Counts recorded by the migration that wrote the marker, or null when no
+ * marker (or an older marker without counts) is present.
+ */
+function readMigrationCounts(): { migrated: number; total: number } | null {
+  try {
+    const marker = JSON.parse(readFileSync(resolve(join(LEGACY_MEMORY_DIR, MIGRATION_MARKER)), 'utf-8'));
+    return typeof marker?.migrated === 'number' && typeof marker?.total === 'number'
+      ? { migrated: marker.migrated, total: marker.total }
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -462,7 +478,7 @@ async function ensureInitialized(dbPath?: string): Promise<void> {
           }
 
           console.error(`[MCP Memory] Migrated ${migrated}/${Object.keys(legacyStore.entries).length} entries`);
-          markMigrationComplete();
+          markMigrationComplete({ migrated, total: Object.keys(legacyStore.entries).length });
         }
       }
     }
@@ -723,7 +739,11 @@ export const memoryTools: MCPTool[] = [
               });
               return {
                 results: r.results.map(e => ({
-                  id: e.id,
+                  // #2271: searchEntries() truncates ids to 12 chars ("entry_" +
+                  // the leading digits of Date.now()), so entries written within
+                  // ~2.8h share one id and RRF fused them into a single result.
+                  // SmartRetrieval dedupes on id: give it the (namespace, key) tuple.
+                  id: JSON.stringify([e.namespace, e.key]),
                   key: e.key,
                   content: e.content,
                   score: e.score,
@@ -897,6 +917,11 @@ export const memoryTools: MCPTool[] = [
       type: 'object',
       properties: {
         namespace: { type: 'string', description: 'Filter by namespace' },
+        tags: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Require entries to include all of these tags (AND). Matches the description claim "optionally filtered by namespace/tags".',
+        },
         limit: { type: 'number', description: 'Maximum results (default: 50)' },
         offset: { type: 'number', description: 'Offset for pagination (default: 0)' },
       },
@@ -906,6 +931,9 @@ export const memoryTools: MCPTool[] = [
       const { listEntries } = await getMemoryFunctions();
 
       const namespace = input.namespace as string | undefined;
+      const tags = Array.isArray(input.tags)
+        ? (input.tags as unknown[]).filter((t): t is string => typeof t === 'string' && t.length > 0)
+        : undefined;
       const limit = (input.limit as number) || 50;
       const offset = (input.offset as number) || 0;
 
@@ -914,6 +942,7 @@ export const memoryTools: MCPTool[] = [
       try {
         const result = await listEntries({
           namespace,
+          tags,
           limit,
           offset,
         });
@@ -921,6 +950,7 @@ export const memoryTools: MCPTool[] = [
         const entries = result.entries.map(e => ({
           key: e.key,
           namespace: e.namespace,
+          tags: e.tags ?? [],
           storedAt: e.createdAt,
           updatedAt: e.updatedAt,
           accessCount: e.accessCount,
@@ -1062,11 +1092,17 @@ export const memoryTools: MCPTool[] = [
     handler: async (input) => {
       const force = input.force as boolean;
 
-      // Remove migration marker if forcing
+      // Remove the migration marker if forcing. hasLegacyStore() checks the marker
+      // beside the legacy store, so that is the one force must clear (#4194);
+      // the old .swarm marker path is cleared too for compatibility.
       if (force) {
-        const markerPath = getMigrationMarkerPath();
-        if (existsSync(markerPath)) {
-          unlinkSync(markerPath);
+        for (const markerPath of [
+          resolve(join(LEGACY_MEMORY_DIR, MIGRATION_MARKER)),
+          getMigrationMarkerPath(),
+        ]) {
+          if (existsSync(markerPath)) {
+            unlinkSync(markerPath);
+          }
         }
       }
 
@@ -1080,13 +1116,38 @@ export const memoryTools: MCPTool[] = [
         };
       }
 
+      // A marker beside the store means a migration already ran; ensureInitialized
+      // would move nothing, so say so instead of reporting the store's size.
+      if (!hasLegacyStore()) {
+        return {
+          success: true,
+          message: 'Legacy store already migrated (marker present); nothing was moved. Pass force: true to re-run.',
+          migrated: 0,
+          total: Object.keys(legacyStore.entries).length,
+        };
+      }
+
       // Run migration via ensureInitialized
       await ensureInitialized();
 
+      // ensureInitialized swallows errors and records what it moved in the marker.
+      const counts = readMigrationCounts();
+      if (!counts) {
+        return {
+          success: false,
+          message: 'Migration did not complete; no entries were recorded as migrated. See the MCP server log.',
+          migrated: 0,
+          total: Object.keys(legacyStore.entries).length,
+        };
+      }
+
       return {
         success: true,
-        message: 'Migration completed',
-        migrated: Object.keys(legacyStore.entries).length,
+        message: counts.migrated === counts.total
+          ? 'Migration completed'
+          : `Migration completed with failures: ${counts.migrated} of ${counts.total} entries migrated`,
+        migrated: counts.migrated,
+        total: counts.total,
         backend: await describeBackend(),
       };
     },
@@ -1596,13 +1657,19 @@ export const memoryTools: MCPTool[] = [
       properties: {
         outputPath: { type: 'string', description: 'File path to write the JSON export to' },
         format: { type: 'string', enum: ['json', 'csv'], description: 'Export format (csv falls back to json today)' },
+        dbPath: { type: 'string', description: 'Explicit memory DB to export (default: the AgentDB store plus the CLI sibling)' },
         namespace: { type: 'string', description: 'Limit export to one namespace' },
         includeVectors: { type: 'boolean', description: 'Include embedding vectors (advisory — not exported yet)' },
       },
       required: ['outputPath'],
     },
     handler: async (input) => {
-      await ensureInitialized();
+      const requestedDbPath = typeof input.dbPath === 'string' && input.dbPath.trim()
+        ? resolve(input.dbPath)
+        : undefined;
+      // An explicit file selection is a single-store read. Do not initialize or
+      // migrate the unrelated default store just to export a snapshot.
+      if (!requestedDbPath) await ensureInitialized();
       const { listEntries } = await getMemoryFunctions();
       const outputPath = String(input.outputPath ?? '');
       if (!outputPath) return { error: 'outputPath is required' };
@@ -1629,14 +1696,16 @@ export const memoryTools: MCPTool[] = [
         } while (out.length < total);
         return { entries: out };
       };
-      const primary = await readStore();
+      const primary = await readStore(requestedDbPath);
       if ('error' in primary) return { error: primary.error };
       // #4148: the default reader is the AgentDB bridge, but the CLI's own store
       // (.swarm/memory.db, possibly encrypted) can hold rows the bridge never
       // sees, so an export silently covered one store and reported success. Read
       // the CLI store too and merge, newest copy of a (namespace, key) winning.
       const warnings: string[] = [];
-      const stores: Array<{ store: string; entries: number }> = [{ store: 'default', entries: primary.entries.length }];
+      const stores: Array<{ store: string; entries: number }> = [
+        { store: requestedDbPath ?? 'default', entries: primary.entries.length },
+      ];
       const merged = new Map<string, ExportEntry>();
       const keep = (e: ExportEntry): void => {
         const id = `${e.namespace}\u0000${e.key}`;
@@ -1644,19 +1713,25 @@ export const memoryTools: MCPTool[] = [
         if (!have || String(e.updatedAt) > String(have.updatedAt)) merged.set(id, e);
       };
       primary.entries.forEach(keep);
-      const cliStore = await resolveCliStorePath();
-      if (cliStore && existsSync(cliStore)) {
-        const secondary = await readStore(cliStore);
-        if ('error' in secondary) {
-          warnings.push(`Could not read the CLI store ${cliStore} (${secondary.error}); the export covers the AgentDB store only.`);
-        } else {
-          stores.push({ store: cliStore, entries: secondary.entries.length });
-          secondary.entries.forEach(keep);
+      // The implicit default export still merges the sibling CLI store; an
+      // explicit dbPath must cover exactly that file.
+      if (!requestedDbPath) {
+        const cliStore = await resolveCliStorePath();
+        if (cliStore && existsSync(cliStore)) {
+          const secondary = await readStore(cliStore);
+          if ('error' in secondary) {
+            warnings.push(`Could not read the CLI store ${cliStore} (${secondary.error}); the export covers the AgentDB store only.`);
+          } else {
+            stores.push({ store: cliStore, entries: secondary.entries.length });
+            secondary.entries.forEach(keep);
+          }
         }
       }
       const all = { entries: [...merged.values()] };
       const payload = {
-        schema: 'ruflo-memory-export/v1',
+        // ruflo-memory-export/v1.1: tags round-trip with export/import.
+        // v1 importers ignore unknown fields; v1.1 importers restore tags.
+        schema: 'ruflo-memory-export/v1.1',
         exportedAt: new Date().toISOString(),
         namespace: namespace ?? null,
         count: all.entries.length,
@@ -1667,6 +1742,8 @@ export const memoryTools: MCPTool[] = [
           // never-populated alias. Fall back to null only if content is
           // missing for backward-compat with the schema.
           value: typeof e.content === 'string' ? e.content : ((e as { value?: unknown }).value ?? null),
+          // Preserve tags so memory_import is lossless for tag sets.
+          tags: Array.isArray(e.tags) ? e.tags : [],
           createdAt: e.createdAt, updatedAt: e.updatedAt, accessCount: e.accessCount, hasEmbedding: e.hasEmbedding, size: e.size,
         })),
       };
@@ -1687,8 +1764,9 @@ export const memoryTools: MCPTool[] = [
   {
     // #1916: `ruflo memory import <file>` referenced an unregistered tool.
     // Reads a ruflo-memory-export JSON and re-stores each entry.
+    // Honour `tags` on each entry (export v1.1+; ignored if absent).
     name: 'memory_import',
-    description: 'Import memory entries from a JSON export file (produced by memory_export) into .swarm/memory.db, re-embedding values. Use when native Read is wrong because the data must be re-stored as memory rows (with new embeddings), not just read. For importing Claude Code\'s own memory files use memory_import_claude. Pair with memory_export on the source.',
+    description: 'Import memory entries from a JSON export file (produced by memory_export) into .swarm/memory.db, re-embedding values. Preserves tags when present in the export (ruflo-memory-export/v1.1+). Use when native Read is wrong because the data must be re-stored as memory rows (with new embeddings), not just read. For importing Claude Code\'s own memory files use memory_import_claude. Pair with memory_export on the source.',
     category: 'memory',
     inputSchema: {
       type: 'object',
@@ -1712,7 +1790,7 @@ export const memoryTools: MCPTool[] = [
       let vectors = 0;
       const inputPath = String(input.inputPath ?? '');
       if (!inputPath || !existsSync(inputPath)) return { error: `File not found: ${inputPath || '(empty)'}` };
-      let doc: { entries?: Array<{ key: string; namespace?: string; value?: unknown }> };
+      let doc: { entries?: Array<{ key: string; namespace?: string; value?: unknown; tags?: string[] | string }> };
       try { doc = JSON.parse(readFileSync(inputPath, 'utf-8')); }
       catch (e) { return { error: `Invalid export JSON: ${(e as Error).message}` }; }
       const entries = Array.isArray(doc.entries) ? doc.entries : [];
@@ -1734,15 +1812,33 @@ export const memoryTools: MCPTool[] = [
           if (keyError) throw new Error(`${keyError}: ${JSON.stringify(e.key)}`);
         }
       }
-      let imported = 0; let skipped = 0; let failed = 0;
+      let imported = 0; let skipped = 0; let failed = 0; let withTags = 0;
       const errors: string[] = [];
       for (const e of entries) {
         if (!e || typeof e.key !== 'string') { skipped++; continue; }
         const value = typeof e.value === 'string' ? e.value : JSON.stringify(e.value ?? null);
+        // Restore tags from export. Accept array or JSON/comma string
+        // for robustness with hand-edited fidelity manifests.
+        let tags: string[] = [];
+        if (Array.isArray(e.tags)) {
+          tags = e.tags.filter((t): t is string => typeof t === 'string' && t.length > 0);
+        } else if (typeof e.tags === 'string' && e.tags.trim()) {
+          try {
+            const parsed = JSON.parse(e.tags);
+            if (Array.isArray(parsed)) {
+              tags = parsed.filter((t): t is string => typeof t === 'string' && t.length > 0);
+            } else {
+              tags = e.tags.split(',').map(s => s.trim()).filter(Boolean);
+            }
+          } catch {
+            tags = e.tags.split(',').map(s => s.trim()).filter(Boolean);
+          }
+        }
         try {
-          const result = await storeEntry({ key: e.key, value, namespace: nsOverride ?? e.namespace ?? 'default', upsert: input.merge !== false, dbPath });
+          const result = await storeEntry({ key: e.key, value, namespace: nsOverride ?? e.namespace ?? 'default', tags, upsert: input.merge !== false, dbPath });
           if (!result.success) throw new Error(result.error || 'Memory write was rejected');
           imported++;
+          if (tags.length > 0) withTags++;
           if (result.embedding) vectors++;
         } catch (error) {
           failed++;
@@ -1754,7 +1850,7 @@ export const memoryTools: MCPTool[] = [
         error: failed > 0 ? `${failed} memory write(s) failed: ${errors.join('; ')}` : undefined,
         failed,
         inputPath,
-        imported: { entries: imported, vectors, patterns: 0 },
+        imported: { entries: imported, vectors, patterns: 0, withTags },
         skipped,
         duration: Date.now() - t0,
       };
